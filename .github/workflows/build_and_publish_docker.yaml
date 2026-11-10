@@ -1,28 +1,157 @@
-name: Build Publish Docker image
+name: Build and publish Docker image
+
 on:
   push:
-    branches:
-      - main
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Required repository secrets:
+#   DOCKER_USERNAME: Docker Hub user with write access to the image repository.
+#   DOCKER_PASSWORD: Docker Hub access token (the existing secret name is retained).
+# Optional repository variable:
+#   DOCKER_IMAGE: namespace/repository; defaults to the original image destination.
+# Runtime credentials belong in a mounted /data/config.json, never in this build.
+env:
+  DOCKER_IMAGE: ${{ vars.DOCKER_IMAGE || 'hdcola/codepracticebot' }}
+
 jobs:
-  push_to_registry:
-    name: Push Docker image to Docker Hub
+  build_and_publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      - name: Check out the repo
-        uses: actions/checkout@v2
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate publishing credentials
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        shell: bash
+        run: |
+          for name in DOCKER_USERNAME DOCKER_PASSWORD; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing required repository secret: $name"
+              exit 1
+            fi
+          done
+
+      - name: Prepare isolated build context
+        id: context
+        shell: bash
+        run: |
+          context="$(mktemp -d "$RUNNER_TEMP/codepracticebot.XXXXXX")"
+          git archive HEAD | tar -x -C "$context"
+          export BUILD_CONTEXT="$context"
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          context = Path(os.environ['BUILD_CONTEXT'])
+          # These constraints apply only in CI; the original requirements stay intact.
+          constraints = '''python-telegram-bot==13.15
+          pyowm==3.3.0
+          icalevents==0.1.25
+          youtube-dl==2021.12.17
+          pafy==0.5.5
+          tzlocal==2.1
+          setuptools<81
+          urllib3<2
+          pytest>=7,<9
+          '''
+          (context / 'ci-constraints.txt').write_text(constraints, encoding='utf-8')
+
+          dockerfile = (context / 'Dockerfile').read_text(encoding='utf-8')
+          # The application uses synchronous Telegram APIs removed in v20 and
+          # stdlib modules removed after Python 3.11. Patch a temporary copy only.
+          dockerfile, bases = re.subn(
+              r'^FROM python:latest\s*$',
+              'FROM python:3.11-bookworm AS runtime',
+              dockerfile, flags=re.MULTILINE,
+          )
+          dockerfile, installs = re.subn(
+              r'^RUN pip install -r requirements\.txt\s*$',
+              'RUN pip install --no-cache-dir -c ci-constraints.txt -r requirements.txt'
+              ' && pip check',
+              dockerfile, flags=re.MULTILINE,
+          )
+          if (bases, installs) != (1, 1):
+              raise SystemExit('Dockerfile changed; review the CI compatibility overrides.')
+
+          # Keep test-only packages out of the published runtime stage.
+          dockerfile += '''
+          FROM runtime AS test
+          RUN pip install --no-cache-dir -c ci-constraints.txt -r requirements-test.txt "python-telegram-bot[passport]==13.15" && pip check
+          RUN python -m compileall -q bot.py citybot.py chstockbot.py sendmsg.py config.py util.py cmdproc mesg
+          RUN python -m pytest -q -p no:cacheprovider
+          RUN python -c "import importlib, pkgutil, cmdproc, mesg; [importlib.import_module(package.__name__ + '.' + module.name) for package in (cmdproc, mesg) for module in pkgutil.iter_modules(package.__path__)]; from telegram.ext import Updater; Updater('123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi', use_context=True)"
+          '''
+          (context / 'Dockerfile.ci').write_text(dockerfile, encoding='utf-8')
+          (context / '.dockerignore').write_text(
+              '.git\n.github\n.env\n.env.*\n**/config.json\nowmkey\n'
+              '**/__pycache__\n.pytest_cache\n', encoding='utf-8',
+          )
+          PY
+          echo "path=$context" >> "$GITHUB_OUTPUT"
+
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v1
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v1
+        uses: docker/setup-buildx-action@v3
+
+      - name: Generate image tags and labels
+        id: metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_IMAGE }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+            type=sha,format=long
+            type=ref,event=pr
+
+      - name: Test dependencies and application on both architectures
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ steps.context.outputs.path }}
+          file: ${{ steps.context.outputs.path }}/Dockerfile.ci
+          target: test
+          platforms: linux/amd64,linux/arm64
+          push: false
+          cache-from: type=gha,scope=codepracticebot
+          cache-to: type=gha,mode=max,scope=codepracticebot
+
       - name: Log in to Docker Hub
-        uses: docker/login-action@v1
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
-      - name: Push to Docker Hub
-        uses: docker/build-push-action@v2
+
+      - name: Build and publish tested runtime image
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ${{ steps.context.outputs.path }}
+          file: ${{ steps.context.outputs.path }}/Dockerfile.ci
+          target: runtime
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: hdcola/codepracticebot:latest
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha,scope=codepracticebot
+          cache-to: type=gha,mode=max,scope=codepracticebot
